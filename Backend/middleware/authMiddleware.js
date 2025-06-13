@@ -1,55 +1,14 @@
 
-// const jwt = require('jsonwebtoken');
-// const asyncHandler = require('express-async-handler');
-// const User = require('../models/userModel');
-// const { verifyToken } = require('../utils/jwtHelper');
-
-// const protect = asyncHandler(async (req, res, next) => {
-//   let token;
-
-//   if (
-//     req.headers.authorization &&
-//     req.headers.authorization.startsWith('Bearer')
-//   ) {
-//     try {
-//       // Get token from header
-//       token = req.headers.authorization.split(' ')[1];
-
-//       // Verify token
-//       const decoded = verifyToken(token);
-
-//       if (!decoded) {
-//         res.status(401);
-//         throw new Error('Not authorized, token failed');
-//       }
-
-//       // Get user from the token
-//       req.user = await User.findById(decoded.id).select('-password');
-
-//       if (!req.user) {
-//         res.status(401);
-//         throw new Error('User not found');
-//       }
-
-//       next();
-//     } catch (error) {
-//       console.error(error);
-//       res.status(401);
-//       throw new Error('Not authorized, token failed');
-//     }
-//   }
-
-//   if (!token) {
-//     res.status(401);
-//     throw new Error('Not authorized, no token');
-//   }
-// });
-
-// module.exports = { protect };
-// Backend/middleware/authMiddleware.js
 const jwt = require('jsonwebtoken');
 const asyncHandler = require('express-async-handler');
 const User = require('../models/userModel');
+const { getRedisClient } = require('../utils/redisClient');
+
+// Cache JWT secret for better performance
+const JWT_SECRET = process.env.JWT_SECRET;
+
+// User cache TTL (5 minutes)
+const USER_CACHE_TTL = 300;
 
 const protect = asyncHandler(async (req, res, next) => {
   let token;
@@ -62,52 +21,161 @@ const protect = asyncHandler(async (req, res, next) => {
       token = req.headers.authorization.split(' ')[1];
 
       // Verify token
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-      // Get user from token
-      req.user = await User.findById(decoded.id).select('-password');
-      if (!req.user) {
+      const decoded = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
+      
+      if (!decoded?.id) {
         res.status(401);
-        throw new Error('Not authorized, user not found');
+        throw new Error('Invalid token payload');
       }
 
+      const redis = getRedisClient();
+      const userCacheKey = `user:${decoded.id}`;
+      
+      // Try to get user from cache first
+      let user = null;
+      if (redis.isAvailable()) {
+        try {
+          const cachedUser = await redis.get(userCacheKey);
+          if (cachedUser) {
+            user = JSON.parse(cachedUser);
+          }
+        } catch (error) {
+          console.error('User cache retrieval error:', error);
+        }
+      }
+
+      // If not in cache, get from database
+      if (!user) {
+        user = await User.findById(decoded.id)
+          .select('-password')
+          .lean(); // Use lean() for better performance
+
+        if (!user) {
+          res.status(401);
+          throw new Error('User not found');
+        }
+
+        // Cache the user for future requests
+        if (redis.isAvailable()) {
+          try {
+            await redis.setex(
+              userCacheKey,
+              USER_CACHE_TTL,
+              JSON.stringify(user)
+            );
+          } catch (error) {
+            console.error('User cache storage error:', error);
+          }
+        }
+      }
+
+      // Attach user to request object
+      req.user = user;
       next();
     } catch (error) {
       console.error('Token verification error:', error.message);
+      
+      let errorMessage = 'Not authorized, invalid token';
+      let statusCode = 401;
+      
       if (error.name === 'TokenExpiredError') {
-        res.status(401);
-        throw new Error('Token expired, please log in again');
+        errorMessage = 'Token expired, please log in again';
+      } else if (error.name === 'JsonWebTokenError') {
+        errorMessage = 'Malformed token';
+      } else if (error.message === 'User not found') {
+        errorMessage = 'Not authorized, user not found';
       }
-      res.status(401);
-      throw new Error('Not authorized, invalid token');
+      
+      res.status(statusCode);
+      throw new Error(errorMessage);
     }
   } else {
     res.status(401);
-    throw new Error('Not authorized, no token');
+    throw new Error('Not authorized, no token provided');
   }
 });
 
-const socketAuth = (socket, next) => {
+const socketAuth = async (socket, next) => {
   const token = socket.handshake.auth.token;
+  
   if (!token) {
     return next(new Error('Authentication error: No token provided'));
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    User.findById(decoded.id)
-      .select('-password')
-      .then((user) => {
-        if (!user) {
-          return next(new Error('Authentication error: User not found'));
+    const decoded = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
+    
+    if (!decoded?.id) {
+      return next(new Error('Authentication error: Invalid token payload'));
+    }
+
+    const redis = getRedisClient();
+    const userCacheKey = `user:${decoded.id}`;
+    
+    // Try to get user from cache first
+    let user = null;
+    if (redis.isAvailable()) {
+      try {
+        const cachedUser = await redis.get(userCacheKey);
+        if (cachedUser) {
+          user = JSON.parse(cachedUser);
         }
-        socket.user = user;
-        next();
-      })
-      .catch(() => next(new Error('Authentication error: Invalid token')));
+      } catch (error) {
+        console.error('Socket user cache retrieval error:', error);
+      }
+    }
+
+    // If not in cache, get from database
+    if (!user) {
+      user = await User.findById(decoded.id)
+        .select('-password')
+        .lean();
+
+      if (!user) {
+        return next(new Error('Authentication error: User not found'));
+      }
+
+      // Cache the user
+      if (redis.isAvailable()) {
+        try {
+          await redis.setex(
+            userCacheKey,
+            USER_CACHE_TTL,
+            JSON.stringify(user)
+          );
+        } catch (error) {
+          console.error('Socket user cache storage error:', error);
+        }
+      }
+    }
+
+    socket.user = user;
+    next();
   } catch (error) {
-    return next(new Error('Authentication error: Token verification failed'));
+    console.error('Socket authentication error:', error.message);
+    
+    let errorMessage = 'Authentication error: Token verification failed';
+    
+    if (error.name === 'TokenExpiredError') {
+      errorMessage = 'Authentication error: Token expired';
+    } else if (error.name === 'JsonWebTokenError') {
+      errorMessage = 'Authentication error: Invalid token';
+    }
+    
+    return next(new Error(errorMessage));
   }
 };
 
-module.exports = { protect,socketAuth };
+// Helper function to invalidate user cache
+const invalidateUserCache = async (userId) => {
+  const redis = getRedisClient();
+  if (redis.isAvailable()) {
+    try {
+      await redis.del(`user:${userId}`);
+    } catch (error) {
+      console.error('User cache invalidation error:', error);
+    }
+  }
+};
+
+module.exports = { protect, socketAuth, invalidateUserCache };

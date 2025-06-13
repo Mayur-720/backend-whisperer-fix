@@ -4,7 +4,42 @@ const Post = require('../models/postModel');
 const User = require('../models/userModel');
 const GhostCircle = require('../models/ghostCircleModel');
 const mongoose = require('mongoose');
-const { log } = require('console');
+const { getRedisClient } = require('../utils/redisClient');
+
+// Cache keys
+const CACHE_KEYS = {
+  GLOBAL_FEED: 'global_feed',
+  GHOST_CIRCLE_POSTS: (id) => `ghost_circle_posts_${id}`,
+  POST_DETAIL: (id) => `post_detail_${id}`,
+};
+
+// Cache TTL (Time To Live) in seconds
+const CACHE_TTL = {
+  GLOBAL_FEED: 300, // 5 minutes
+  GHOST_CIRCLE_POSTS: 600, // 10 minutes
+  POST_DETAIL: 1800, // 30 minutes
+};
+
+// Helper function to invalidate related caches
+const invalidatePostCaches = async (postId, ghostCircleId = null) => {
+  try {
+    const redis = getRedisClient();
+    if (redis.isAvailable()) {
+      const keysToDelete = [
+        CACHE_KEYS.GLOBAL_FEED,
+        CACHE_KEYS.POST_DETAIL(postId)
+      ];
+      
+      if (ghostCircleId) {
+        keysToDelete.push(CACHE_KEYS.GHOST_CIRCLE_POSTS(ghostCircleId));
+      }
+      
+      await Promise.all(keysToDelete.map(key => redis.del(key)));
+    }
+  } catch (error) {
+    console.error('Cache invalidation error:', error);
+  }
+};
 
 // @desc    Create a new post (global or in ghost circle)
 // @route   POST /api/posts
@@ -36,8 +71,8 @@ const createPost = asyncHandler(async (req, res) => {
 
   // Check if the post is for a specific ghost circle
   if (ghostCircleId) {
-    // Check if ghost circle exists and user is a member
-    const ghostCircle = await GhostCircle.findById(ghostCircleId);
+    // Check if ghost circle exists and user is a member (with lean query)
+    const ghostCircle = await GhostCircle.findById(ghostCircleId).lean();
 
     if (!ghostCircle) {
       res.status(404);
@@ -53,28 +88,46 @@ const createPost = asyncHandler(async (req, res) => {
       throw new Error('Not authorized to post in this ghost circle');
     }
 
-    // Add ghost circle reference to post data
     postData.ghostCircle = ghostCircleId;
   }
 
-  // Create the post
-  const post = await Post.create(postData);
+  // Use session for atomic operations
+  const session = await mongoose.startSession();
+  
+  try {
+    session.startTransaction();
 
-  // Add post ID to the user's posts array
-  const user = await User.findById(req.user._id);
-  user.posts.push(post._id); // Add the new post ID to the user's posts array
-  await user.save();
+    // Create the post
+    const [post] = await Post.create([postData], { session });
 
-  // If posting to a ghost circle, add post to the circle's posts
-  if (ghostCircleId) {
-    await GhostCircle.findByIdAndUpdate(
-      ghostCircleId,
-      { $push: { posts: post._id } }
+    // Add post ID to the user's posts array
+    await User.findByIdAndUpdate(
+      req.user._id,
+      { $push: { posts: post._id } },
+      { session }
     );
-  }
 
-  // Return the newly created post
-  res.status(201).json(post);
+    // If posting to a ghost circle, add post to the circle's posts
+    if (ghostCircleId) {
+      await GhostCircle.findByIdAndUpdate(
+        ghostCircleId,
+        { $push: { posts: post._id } },
+        { session }
+      );
+    }
+
+    await session.commitTransaction();
+
+    // Invalidate related caches
+    await invalidatePostCaches(post._id, ghostCircleId);
+
+    res.status(201).json(post);
+  } catch (error) {
+    await session.abortTransaction();
+    throw error;
+  } finally {
+    session.endSession();
+  }
 });
 
 // @desc    Update a post
@@ -96,13 +149,22 @@ const updatePost = asyncHandler(async (req, res) => {
     throw new Error('Not authorized to update this post');
   }
 
-  // Update post fields
-  post.content = content !== undefined ? content : post.content;
-  post.imageUrl = imageUrl !== undefined ? imageUrl : post.imageUrl;
-  post.images = images !== undefined ? images : post.images;
-  post.videos = videos !== undefined ? videos : post.videos;
+  // Update post fields efficiently
+  const updateFields = {};
+  if (content !== undefined) updateFields.content = content;
+  if (imageUrl !== undefined) updateFields.imageUrl = imageUrl;
+  if (images !== undefined) updateFields.images = images;
+  if (videos !== undefined) updateFields.videos = videos;
 
-  const updatedPost = await post.save();
+  const updatedPost = await Post.findByIdAndUpdate(
+    req.params.id,
+    updateFields,
+    { new: true, runValidators: true }
+  );
+
+  // Invalidate related caches
+  await invalidatePostCaches(req.params.id, post.ghostCircle);
+
   res.json(updatedPost);
 });
 
@@ -110,7 +172,7 @@ const updatePost = asyncHandler(async (req, res) => {
 // @route   DELETE /api/posts/delete/:postId
 // @access  Private
 const deletepost = asyncHandler(async (req, res) => {
-  const post = await Post.findById(req.params.postId);
+  const post = await Post.findById(req.params.postId).lean();
 
   if (!post) {
     res.status(404);
@@ -124,6 +186,10 @@ const deletepost = asyncHandler(async (req, res) => {
   }
 
   await Post.findByIdAndDelete(req.params.postId);
+
+  // Invalidate related caches
+  await invalidatePostCaches(req.params.postId, post.ghostCircle);
+
   res.json({ message: 'Post deleted successfully' });
 });
 
@@ -131,53 +197,82 @@ const deletepost = asyncHandler(async (req, res) => {
 // @route   GET /api/posts/global
 // @access  Private
 const getGlobalFeed = asyncHandler(async (req, res) => {
+  const redis = getRedisClient();
+  
+  // Try to get from cache first
+  if (redis.isAvailable()) {
+    try {
+      const cachedPosts = await redis.get(CACHE_KEYS.GLOBAL_FEED);
+      if (cachedPosts) {
+        return res.json(JSON.parse(cachedPosts));
+      }
+    } catch (error) {
+      console.error('Cache retrieval error:', error);
+    }
+  }
+
+  // If not in cache, query database with optimizations
   const posts = await Post.find({
     ghostCircle: { $exists: false },
     expiresAt: { $gt: new Date() },
   })
     .sort({ createdAt: -1 })
-    .limit(30);
+    .limit(30)
+    .lean(); // Use lean() for better performance
+
+  // Cache the result
+  if (redis.isAvailable()) {
+    try {
+      await redis.setex(
+        CACHE_KEYS.GLOBAL_FEED,
+        CACHE_TTL.GLOBAL_FEED,
+        JSON.stringify(posts)
+      );
+    } catch (error) {
+      console.error('Cache storage error:', error);
+    }
+  }
   
   res.json(posts);
 });
 
-// controllers/postController.js
+// @desc    Add comment to post
+// @route   POST /api/posts/:id/comments
+// @access  Private
 const addComment = asyncHandler(async (req, res) => {
   const { content, anonymousAlias } = req.body;
   
-  // Validate input fields
   if (!content || !anonymousAlias) {
     return res.status(400).json({ message: 'Comment content and alias are required' });
   }
 
   try {
-    // Find the post
-    const post = await Post.findById(req.params.id);
-    if (!post) {
-      return res.status(404).json({ message: 'Post not found' });
-    }
-
-    // Create the new comment object
     const newComment = {
-      user: req.user._id, // comes from auth middleware
+      user: req.user._id,
       content,
       anonymousAlias,
       avatarEmoji: req.user.avatarEmoji || "🎭",
       _id: new mongoose.Types.ObjectId()
     };
 
-    // Add new comment to the beginning of the comments array
-    post.comments.unshift(newComment);
+    const post = await Post.findByIdAndUpdate(
+      req.params.id,
+      { $push: { comments: { $each: [newComment], $position: 0 } } },
+      { new: true, runValidators: true }
+    );
 
-    // Save the post with the new comment
-    await post.save();
+    if (!post) {
+      return res.status(404).json({ message: 'Post not found' });
+    }
+
+    // Invalidate related caches
+    await invalidatePostCaches(req.params.id, post.ghostCircle);
 
     res.status(201).json({
       message: 'Comment added successfully',
       comment: newComment,
     });
   } catch (err) {
-    // Handle server error
     res.status(500).json({
       message: 'Server error',
       error: err.message,
@@ -191,45 +286,37 @@ const addComment = asyncHandler(async (req, res) => {
 const editComment = asyncHandler(async (req, res) => {
   const { content } = req.body;
   
-  // Validate content
   if (!content) {
     res.status(400);
     throw new Error('Comment content is required');
   }
   
   try {
-    // Find the post
-    const post = await Post.findById(req.params.id);
-    if (!post) {
-      res.status(404);
-      throw new Error('Post not found');
-    }
-    
-    // Find the comment by ID
-    const commentIndex = post.comments.findIndex(
-      comment => comment._id.toString() === req.params.commentId
+    const post = await Post.findOneAndUpdate(
+      { 
+        _id: req.params.id,
+        'comments._id': req.params.commentId,
+        'comments.user': req.user._id
+      },
+      { 
+        $set: { 'comments.$.content': content }
+      },
+      { new: true }
     );
     
-    if (commentIndex === -1) {
+    if (!post) {
       res.status(404);
-      throw new Error('Comment not found');
+      throw new Error('Post or comment not found, or not authorized');
     }
     
-    // Check if user is the comment author
-    if (post.comments[commentIndex].user.toString() !== req.user._id.toString()) {
-      res.status(403);
-      throw new Error('Not authorized to edit this comment');
-    }
+    const updatedComment = post.comments.id(req.params.commentId);
     
-    // Update the comment content
-    post.comments[commentIndex].content = content;
-    
-    // Save the post with updated comment
-    await post.save();
+    // Invalidate related caches
+    await invalidatePostCaches(req.params.id, post.ghostCircle);
     
     res.json({
       message: 'Comment updated successfully',
-      comment: post.comments[commentIndex]
+      comment: updatedComment
     });
   } catch (error) {
     console.error('Edit comment error:', error);
@@ -242,25 +329,19 @@ const editComment = asyncHandler(async (req, res) => {
 // @access  Private
 const deleteComment = asyncHandler(async (req, res) => {
   try {
-    // Find the post
     const post = await Post.findById(req.params.id);
     if (!post) {
       res.status(404);
       throw new Error('Post not found');
     }
     
-    // Find the comment by ID
-    const commentIndex = post.comments.findIndex(
-      comment => comment._id.toString() === req.params.commentId
-    );
-    
-    if (commentIndex === -1) {
+    const comment = post.comments.id(req.params.commentId);
+    if (!comment) {
       res.status(404);
       throw new Error('Comment not found');
     }
     
-    // Check if user is the comment author or post author
-    const isCommentAuthor = post.comments[commentIndex].user.toString() === req.user._id.toString();
+    const isCommentAuthor = comment.user.toString() === req.user._id.toString();
     const isPostAuthor = post.user.toString() === req.user._id.toString();
     
     if (!isCommentAuthor && !isPostAuthor) {
@@ -268,11 +349,14 @@ const deleteComment = asyncHandler(async (req, res) => {
       throw new Error('Not authorized to delete this comment');
     }
     
-    // Remove the comment
-    post.comments.splice(commentIndex, 1);
+    // Use pull to remove the comment
+    await Post.findByIdAndUpdate(
+      req.params.id,
+      { $pull: { comments: { _id: req.params.commentId } } }
+    );
     
-    // Save the post
-    await post.save();
+    // Invalidate related caches
+    await invalidatePostCaches(req.params.id, post.ghostCircle);
     
     res.json({ message: 'Comment deleted successfully' });
   } catch (error) {
@@ -287,31 +371,12 @@ const deleteComment = asyncHandler(async (req, res) => {
 const replyToComment = asyncHandler(async (req, res) => {
   const { content, anonymousAlias } = req.body;
   
-  // Validate content and alias
   if (!content || !anonymousAlias) {
     res.status(400);
     throw new Error('Reply content and alias are required');
   }
   
   try {
-    // Find the post
-    const post = await Post.findById(req.params.id);
-    if (!post) {
-      res.status(404);
-      throw new Error('Post not found');
-    }
-    
-    // Find the comment to reply to
-    const commentIndex = post.comments.findIndex(
-      comment => comment._id.toString() === req.params.commentId
-    );
-    
-    if (commentIndex === -1) {
-      res.status(404);
-      throw new Error('Comment not found');
-    }
-    
-    // Create the reply
     const reply = {
       user: req.user._id,
       content,
@@ -321,16 +386,24 @@ const replyToComment = asyncHandler(async (req, res) => {
       createdAt: new Date()
     };
     
-    // Initialize replies array if it doesn't exist
-    if (!post.comments[commentIndex].replies) {
-      post.comments[commentIndex].replies = [];
+    const post = await Post.findOneAndUpdate(
+      { 
+        _id: req.params.id,
+        'comments._id': req.params.commentId
+      },
+      { 
+        $push: { 'comments.$.replies': reply }
+      },
+      { new: true }
+    );
+    
+    if (!post) {
+      res.status(404);
+      throw new Error('Post or comment not found');
     }
     
-    // Add the reply to the comment
-    post.comments[commentIndex].replies.push(reply);
-    
-    // Save the post
-    await post.save();
+    // Invalidate related caches
+    await invalidatePostCaches(req.params.id, post.ghostCircle);
     
     res.status(201).json({
       message: 'Reply added successfully',
@@ -342,8 +415,11 @@ const replyToComment = asyncHandler(async (req, res) => {
   }
 });
 
+// @desc    Get comments for a post
+// @route   GET /api/posts/:id/comments
+// @access  Private
 const getComments = asyncHandler(async (req, res) => {
-  const post = await Post.findById(req.params.id);
+  const post = await Post.findById(req.params.id).select('comments').lean();
   if (!post) {
     res.status(404);
     throw new Error('Post not found');
@@ -355,8 +431,23 @@ const getComments = asyncHandler(async (req, res) => {
 // @route   GET /api/posts/circle/:id
 // @access  Private
 const getGhostCirclePosts = asyncHandler(async (req, res) => {
+  const redis = getRedisClient();
+  const cacheKey = CACHE_KEYS.GHOST_CIRCLE_POSTS(req.params.id);
+  
+  // Try to get from cache first
+  if (redis.isAvailable()) {
+    try {
+      const cachedPosts = await redis.get(cacheKey);
+      if (cachedPosts) {
+        return res.json(JSON.parse(cachedPosts));
+      }
+    } catch (error) {
+      console.error('Cache retrieval error:', error);
+    }
+  }
+
   // Check if user is member of the ghost circle
-  const ghostCircle = await GhostCircle.findById(req.params.id);
+  const ghostCircle = await GhostCircle.findById(req.params.id).lean();
   
   if (!ghostCircle) {
     res.status(404);
@@ -375,7 +466,22 @@ const getGhostCirclePosts = asyncHandler(async (req, res) => {
   const posts = await Post.find({
     ghostCircle: req.params.id,
     expiresAt: { $gt: new Date() },
-  }).sort({ createdAt: -1 });
+  })
+    .sort({ createdAt: -1 })
+    .lean();
+
+  // Cache the result
+  if (redis.isAvailable()) {
+    try {
+      await redis.setex(
+        cacheKey,
+        CACHE_TTL.GHOST_CIRCLE_POSTS,
+        JSON.stringify(posts)
+      );
+    } catch (error) {
+      console.error('Cache storage error:', error);
+    }
+  }
   
   res.json(posts);
 });
@@ -384,6 +490,8 @@ const getGhostCirclePosts = asyncHandler(async (req, res) => {
 // @route   PUT /api/posts/:id/like
 // @access  Private
 const likePost = asyncHandler(async (req, res) => {
+  const userId = req.user._id.toString();
+  
   const post = await Post.findById(req.params.id);
   
   if (!post) {
@@ -391,32 +499,47 @@ const likePost = asyncHandler(async (req, res) => {
     throw new Error('Post not found');
   }
   
-  // Check if post has already been liked by user
   const alreadyLiked = post.likes.some(like => 
-    like.user.toString() === req.user._id.toString()
+    like.user.toString() === userId
   );
+  
+  let updateOperation;
   
   if (alreadyLiked) {
     // Remove like
-    post.likes = post.likes.filter(like => 
-      like.user.toString() !== req.user._id.toString()
-    );
+    updateOperation = { $pull: { likes: { user: userId } } };
   } else {
-    // Add like
-    post.likes.push({ 
-      user: req.user._id, 
-      anonymousAlias: req.user.anonymousAlias 
-    });
+    // Add like and extend post life
+    updateOperation = { 
+      $push: { 
+        likes: { 
+          user: req.user._id, 
+          anonymousAlias: req.user.anonymousAlias 
+        } 
+      }
+    };
     
-    // Extend post life by 1 hour
+    // Extend post life by 1 hour if not expired
     if (post.expiresAt > new Date()) {
-      post.expiresAt = new Date(post.expiresAt.getTime() + 60 * 60 * 1000);
+      updateOperation.$set = { 
+        expiresAt: new Date(post.expiresAt.getTime() + 60 * 60 * 1000) 
+      };
     }
   }
   
-  await post.save();
+  const updatedPost = await Post.findByIdAndUpdate(
+    req.params.id,
+    updateOperation,
+    { new: true }
+  );
   
-  res.json({ likes: post.likes.length, expiresAt: post.expiresAt });
+  // Invalidate related caches
+  await invalidatePostCaches(req.params.id, post.ghostCircle);
+  
+  res.json({ 
+    likes: updatedPost.likes.length, 
+    expiresAt: updatedPost.expiresAt 
+  });
 });
 
 // @desc    Try to recognize post author
@@ -430,7 +553,7 @@ const recognizeUser = asyncHandler(async (req, res) => {
     throw new Error('Please provide a username guess');
   }
   
-  const post = await Post.findById(req.params.id);
+  const post = await Post.findById(req.params.id).lean();
   
   if (!post) {
     res.status(404);
@@ -438,7 +561,7 @@ const recognizeUser = asyncHandler(async (req, res) => {
   }
   
   // Find the guessed user
-  const guessedUser = await User.findOne({ username: guessUsername });
+  const guessedUser = await User.findOne({ username: guessUsername }).lean();
   
   if (!guessedUser) {
     return res.status(200).json({ 
@@ -452,36 +575,37 @@ const recognizeUser = asyncHandler(async (req, res) => {
   
   if (isCorrect) {
     // Check if already recognized
-    const alreadyRecognized = req.user.recognizedUsers.some(ru => 
+    const currentUser = await User.findById(req.user._id).lean();
+    const alreadyRecognized = currentUser.recognizedUsers?.some(ru => 
       ru.userId.toString() === post.user.toString()
     );
     
     if (!alreadyRecognized) {
-      // Add to recognized users
-      await User.findByIdAndUpdate(
-        req.user._id,
-        { 
-          $push: { 
-            recognizedUsers: { 
-              userId: post.user, 
-              recognizedAt: new Date() 
+      // Use atomic operations to update both users
+      await Promise.all([
+        User.findByIdAndUpdate(
+          req.user._id,
+          { 
+            $push: { 
+              recognizedUsers: { 
+                userId: post.user, 
+                recognizedAt: new Date() 
+              } 
             } 
-          } 
-        }
-      );
-      
-      // Add to identity recognizers of the post author
-      await User.findByIdAndUpdate(
-        post.user,
-        { 
-          $push: { 
-            identityRecognizers: { 
-              userId: req.user._id, 
-              recognizedAt: new Date() 
+          }
+        ),
+        User.findByIdAndUpdate(
+          post.user,
+          { 
+            $push: { 
+              identityRecognizers: { 
+                userId: req.user._id, 
+                recognizedAt: new Date() 
+              } 
             } 
-          } 
-        }
-      );
+          }
+        )
+      ]);
     }
     
     return res.json({ 
@@ -501,29 +625,69 @@ const recognizeUser = asyncHandler(async (req, res) => {
   }
 });
 
+// @desc    Increment share count
+// @route   PUT /api/posts/:postId/share
+// @access  Private
 const incrementShareCount = asyncHandler(async (req, res) => {
   const { postId } = req.params;
 
-  const post = await Post.findById(postId);
+  const post = await Post.findByIdAndUpdate(
+    postId,
+    { $inc: { shareCount: 1 } },
+    { new: true }
+  );
+
   if (!post) {
     res.status(404);
     throw new Error('Post not found');
   }
 
-  post.shareCount += 1; // Increment share count
-  await post.save();
+  // Invalidate related caches
+  await invalidatePostCaches(postId, post.ghostCircle);
 
   res.status(200).json({ shareCount: post.shareCount });
 });
 
+// @desc    Get post by ID
+// @route   GET /api/posts/:id
+// @access  Private
 const getPostById = asyncHandler(async (req, res) => {
+  const redis = getRedisClient();
+  const cacheKey = CACHE_KEYS.POST_DETAIL(req.params.id);
+  
+  // Try to get from cache first
+  if (redis.isAvailable()) {
+    try {
+      const cachedPost = await redis.get(cacheKey);
+      if (cachedPost) {
+        return res.json(JSON.parse(cachedPost));
+      }
+    } catch (error) {
+      console.error('Cache retrieval error:', error);
+    }
+  }
+
   const post = await Post.findById(req.params.id)
     .populate('user', 'anonymousAlias avatarEmoji username')
-    .populate('comments.user', 'anonymousAlias avatarEmoji');
+    .populate('comments.user', 'anonymousAlias avatarEmoji')
+    .lean();
 
   if (!post) {
     res.status(404);
     throw new Error('Post not found');
+  }
+
+  // Cache the result
+  if (redis.isAvailable()) {
+    try {
+      await redis.setex(
+        cacheKey,
+        CACHE_TTL.POST_DETAIL,
+        JSON.stringify(post)
+      );
+    } catch (error) {
+      console.error('Cache storage error:', error);
+    }
   }
 
   res.json(post);
