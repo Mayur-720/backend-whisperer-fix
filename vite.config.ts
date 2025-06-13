@@ -1,3 +1,4 @@
+
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react-swc";
 import path from "path";
@@ -19,4 +20,15 @@ export default defineConfig(({ mode }) => ({
       "@": path.resolve(__dirname, "./src"),
     },
   },
+  optimizeDeps: {
+    exclude: ['@rollup/rollup-linux-x64-gnu'],
+    include: ['react', 'react-dom']
+  },
+  build: {
+    rollupOptions: {
+      external: (id) => {
+        return id.includes('@rollup/rollup-linux-x64-gnu');
+      }
+    }
+  }
 }));
