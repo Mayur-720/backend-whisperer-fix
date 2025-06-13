@@ -1,8 +1,8 @@
-
 // controllers/whisperController.js
 const asyncHandler = require("express-async-handler");
 const Whisper = require("../models/whisperModel");
 const User = require("../models/userModel");
+const Notification = require("../models/notificationModel");
 
 // @desc    Save a whisper message (for WebSocket and REST)
 // @access  Private
@@ -34,18 +34,49 @@ const saveWhisper = asyncHandler(
 				visibilityLevel,
 			});
 
-			// Save notification
+			// Save notification to database
 			const notification = await Notification.create({
 				title: `New Whisper from ${senderAlias} ${senderEmoji}`,
 				message: content,
 				userId: receiverId,
+				type: 'whisper',
+				data: {
+					whisperId: whisper._id,
+					senderId: senderId,
+					senderAlias,
+					senderEmoji
+				}
 			});
+
+			// Send OneSignal push notification
+			if (receiver.oneSignalPlayerId) {
+				try {
+					await sendOneSignalNotification({
+						playerIds: [receiver.oneSignalPlayerId],
+						title: `New Whisper from ${senderAlias} ${senderEmoji}`,
+						message: content,
+						data: {
+							type: 'whisper',
+							whisperId: whisper._id.toString(),
+							senderId: senderId.toString(),
+							senderAlias,
+							senderEmoji
+						},
+						url: `/whispers?conversation=${senderId}`
+					});
+				} catch (pushError) {
+					console.error('OneSignal push notification failed:', pushError);
+					// Don't throw error, just log it
+				}
+			}
 
 			// Emit Socket.IO event to receiver's individual room and conversation room
 			if (global.io) {
 				global.io.to(receiverId.toString()).emit("notification", {
 					title: `New Whisper from ${senderAlias} ${senderEmoji}`,
 					body: content,
+					type: 'whisper',
+					data: notification.data
 				});
 				const room = [senderId.toString(), receiverId.toString()]
 					.sort()
@@ -53,6 +84,8 @@ const saveWhisper = asyncHandler(
 				global.io.to(room).emit("notification", {
 					title: `New Whisper from ${senderAlias} ${senderEmoji}`,
 					body: content,
+					type: 'whisper',
+					data: notification.data
 				});
 				console.log(`Notification emitted to ${receiverId} and room ${room}`);
 			} else {
@@ -69,6 +102,55 @@ const saveWhisper = asyncHandler(
 		}
 	}
 );
+
+// OneSignal notification helper function
+const sendOneSignalNotification = async ({ playerIds, title, message, data, url }) => {
+	const https = require('https');
+	
+	const options = {
+		host: 'onesignal.com',
+		port: 443,
+		path: '/api/v1/notifications',
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json; charset=utf-8',
+			'Authorization': `Basic ${process.env.ONESIGNAL_REST_API_KEY}`
+		}
+	};
+
+	const notification = {
+		app_id: process.env.ONESIGNAL_APP_ID,
+		include_player_ids: playerIds,
+		headings: { en: title },
+		contents: { en: message },
+		data: data,
+		url: url,
+		web_url: url
+	};
+
+	return new Promise((resolve, reject) => {
+		const req = https.request(options, (res) => {
+			let responseData = '';
+			res.on('data', (chunk) => {
+				responseData += chunk;
+			});
+			res.on('end', () => {
+				if (res.statusCode === 200) {
+					resolve(JSON.parse(responseData));
+				} else {
+					reject(new Error(`OneSignal API error: ${res.statusCode} - ${responseData}`));
+				}
+			});
+		});
+
+		req.on('error', (error) => {
+			reject(error);
+		});
+
+		req.write(JSON.stringify(notification));
+		req.end();
+	});
+};
 
 // @desc    Send a new whisper message (REST)
 // @route   POST /api/whispers

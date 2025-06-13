@@ -65,9 +65,55 @@ class OneSignalService {
 				console.log("Notification clicked:", event);
 				this.handleNotificationClick(event);
 			});
+
+			// Handle foreground notifications for whispers
+			OneSignal.Notifications.addEventListener("foregroundWillDisplay", (event) => {
+				console.log("Foreground notification received:", event);
+				const notificationData = event.notification.additionalData;
+				
+				if (notificationData?.type === 'whisper') {
+					// Show custom in-app notification for whispers
+					this.showInAppWhisperNotification(event.notification);
+				}
+			});
 		} catch (error) {
 			console.error("Failed to setup event listeners:", error);
 		}
+	}
+
+	private showInAppWhisperNotification(notification: any): void {
+		// Create custom toast notification for whispers
+		const toast = document.createElement('div');
+		toast.className = 'fixed top-4 right-4 bg-purple-600 text-white p-4 rounded-lg shadow-lg z-50 max-w-sm';
+		toast.innerHTML = `
+			<div class="flex items-center">
+				<div class="flex-1">
+					<div class="font-semibold">${notification.title}</div>
+					<div class="text-sm opacity-90">${notification.body}</div>
+				</div>
+				<button class="ml-2 text-white hover:text-gray-300" onclick="this.parentElement.parentElement.remove()">×</button>
+			</div>
+		`;
+		
+		// Add click handler to navigate to whispers
+		toast.onclick = () => {
+			const data = notification.additionalData;
+			if (data?.senderId) {
+				window.location.href = `/whispers?conversation=${data.senderId}`;
+			} else {
+				window.location.href = '/whispers';
+			}
+			toast.remove();
+		};
+		
+		document.body.appendChild(toast);
+		
+		// Auto remove after 5 seconds
+		setTimeout(() => {
+			if (toast.parentElement) {
+				toast.remove();
+			}
+		}, 5000);
 	}
 
 	async requestPermissionAndSubscribe(): Promise<{
@@ -203,6 +249,24 @@ class OneSignalService {
 		if (isSubscribed) {
 			const playerId = OneSignal.User.PushSubscription.id;
 			console.log("User subscribed with player ID:", playerId);
+			
+			// Send player ID to backend to store in user profile
+			try {
+				const token = localStorage.getItem('token');
+				if (token && playerId) {
+					await fetch('/api/users/update-onesignal-id', {
+						method: 'POST',
+						headers: {
+							'Content-Type': 'application/json',
+							'Authorization': `Bearer ${token}`
+						},
+						body: JSON.stringify({ oneSignalPlayerId: playerId })
+					});
+				}
+			} catch (error) {
+				console.error('Failed to update OneSignal player ID:', error);
+			}
+			
 			window.dispatchEvent(
 				new CustomEvent("onesignal:subscribed", {
 					detail: { playerId },
@@ -216,9 +280,18 @@ class OneSignalService {
 
 	private handleNotificationClick(event: any): void {
 		console.log("Notification clicked:", event);
-		if (event.result?.url) {
+		const data = event.notification.additionalData;
+		
+		if (data?.type === 'whisper') {
+			if (data.senderId) {
+				window.location.href = `/whispers?conversation=${data.senderId}`;
+			} else {
+				window.location.href = '/whispers';
+			}
+		} else if (event.result?.url) {
 			window.open(event.result.url, "_blank");
 		}
+		
 		window.dispatchEvent(
 			new CustomEvent("onesignal:notificationClick", {
 				detail: event,

@@ -46,4 +46,26 @@ router.post("/api/whispers", protect, sendWhisper); // Send a new whisper
 router.get("/api/whispers", protect, getMyWhispers); // Get all whispers
 router.get("/api/whispers/:userId", protect, getWhisperConversation); // Get conversation with specific user
 
+// Add this route to update OneSignal player ID
+router.post("/update-onesignal-id", protect, async (req, res) => {
+	try {
+		const { oneSignalPlayerId } = req.body;
+		
+		if (!oneSignalPlayerId) {
+			return res.status(400).json({ message: "OneSignal player ID is required" });
+		}
+
+		const user = await User.findByIdAndUpdate(
+			req.user._id,
+			{ oneSignalPlayerId },
+			{ new: true }
+		).select('-password');
+
+		res.json({ message: "OneSignal player ID updated successfully", user });
+	} catch (error) {
+		console.error("Error updating OneSignal player ID:", error);
+		res.status(500).json({ message: "Failed to update OneSignal player ID" });
+	}
+});
+
 module.exports = router;
