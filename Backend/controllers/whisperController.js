@@ -2,15 +2,12 @@
 const asyncHandler = require("express-async-handler");
 const Whisper = require("../models/whisperModel");
 const User = require("../models/userModel");
-const Notification = require("../models/notificationModel");
 
 // @desc    Save a whisper message (for WebSocket and REST)
 // @access  Private
 const saveWhisper = asyncHandler(
 	async ({ senderId, receiverId, content, senderAlias, senderEmoji }) => {
 		try {
-			console.log(`Saving whisper from ${senderId} to ${receiverId}`);
-			
 			const receiver = await User.findById(receiverId);
 			if (!receiver) {
 				console.error(`Receiver not found for ID: ${receiverId}`);
@@ -36,66 +33,27 @@ const saveWhisper = asyncHandler(
 				visibilityLevel,
 			});
 
-			console.log(`Whisper created: ${whisper._id}`);
-
-			// Save notification to database
+			// Save notification
 			const notification = await Notification.create({
 				title: `New Whisper from ${senderAlias} ${senderEmoji}`,
 				message: content,
 				userId: receiverId,
-				type: 'whisper',
-				data: {
-					whisperId: whisper._id,
-					senderId: senderId,
-					senderAlias,
-					senderEmoji
-				}
 			});
-
-			console.log(`Notification created: ${notification._id}`);
-
-			// Send OneSignal push notification
-			if (receiver.oneSignalPlayerId) {
-				try {
-					await sendOneSignalNotification({
-						playerIds: [receiver.oneSignalPlayerId],
-						title: `New Whisper from ${senderAlias} ${senderEmoji}`,
-						message: content,
-						data: {
-							type: 'whisper',
-							whisperId: whisper._id.toString(),
-							senderId: senderId.toString(),
-							senderAlias,
-							senderEmoji
-						},
-						url: `/whispers?conversation=${senderId}`
-					});
-					console.log(`OneSignal notification sent to ${receiver.oneSignalPlayerId}`);
-				} catch (pushError) {
-					console.error('OneSignal push notification failed:', pushError);
-					// Don't throw error, just log it
-				}
-			}
 
 			// Emit Socket.IO event to receiver's individual room and conversation room
 			if (global.io) {
 				global.io.to(receiverId.toString()).emit("notification", {
 					title: `New Whisper from ${senderAlias} ${senderEmoji}`,
 					body: content,
-					type: 'whisper',
-					data: notification.data
 				});
-				
 				const room = [senderId.toString(), receiverId.toString()]
 					.sort()
 					.join(":");
 				global.io.to(room).emit("notification", {
 					title: `New Whisper from ${senderAlias} ${senderEmoji}`,
 					body: content,
-					type: 'whisper',
-					data: notification.data
 				});
-				console.log(`Socket notifications emitted to ${receiverId} and room ${room}`);
+				console.log(`Notification emitted to ${receiverId} and room ${room}`);
 			} else {
 				console.warn("global.io not initialized");
 			}
@@ -111,55 +69,6 @@ const saveWhisper = asyncHandler(
 	}
 );
 
-// OneSignal notification helper function
-const sendOneSignalNotification = async ({ playerIds, title, message, data, url }) => {
-	const https = require('https');
-	
-	const options = {
-		host: 'onesignal.com',
-		port: 443,
-		path: '/api/v1/notifications',
-		method: 'POST',
-		headers: {
-			'Content-Type': 'application/json; charset=utf-8',
-			'Authorization': `Basic ${process.env.ONESIGNAL_REST_API_KEY}`
-		}
-	};
-
-	const notification = {
-		app_id: process.env.ONESIGNAL_APP_ID,
-		include_player_ids: playerIds,
-		headings: { en: title },
-		contents: { en: message },
-		data: data,
-		url: url,
-		web_url: url
-	};
-
-	return new Promise((resolve, reject) => {
-		const req = https.request(options, (res) => {
-			let responseData = '';
-			res.on('data', (chunk) => {
-				responseData += chunk;
-			});
-			res.on('end', () => {
-				if (res.statusCode === 200) {
-					resolve(JSON.parse(responseData));
-				} else {
-					reject(new Error(`OneSignal API error: ${res.statusCode} - ${responseData}`));
-				}
-			});
-		});
-
-		req.on('error', (error) => {
-			reject(error);
-		});
-
-		req.write(JSON.stringify(notification));
-		req.end();
-	});
-};
-
 // @desc    Send a new whisper message (REST)
 // @route   POST /api/whispers
 // @access  Private
@@ -171,8 +80,6 @@ const sendWhisper = asyncHandler(async (req, res) => {
 		res.status(400);
 		throw new Error("Please provide receiver and message content");
 	}
-
-	console.log(`REST API whisper from ${req.user._id} to ${receiverId}`);
 
 	const whisper = await saveWhisper({
 		senderId: req.user._id,
@@ -186,8 +93,6 @@ const sendWhisper = asyncHandler(async (req, res) => {
 	if (global.io) {
 		const room = [req.user._id.toString(), receiverId].sort().join(":");
 		global.io.to(room).emit("receiveWhisper", whisper);
-		global.io.to(receiverId).emit("receiveWhisper", whisper);
-		console.log(`REST whisper emitted to room: ${room} and receiver: ${receiverId}`);
 	}
 
 	res.status(201).json(whisper);
