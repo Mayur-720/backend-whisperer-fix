@@ -17,3 +17,6 @@ export function useIsMobile() {
 
   return !!isMobile
 }
+
+// Keep legacy name for backward compatibility
+export const useMobile = useIsMobile
