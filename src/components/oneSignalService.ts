@@ -71,7 +71,8 @@ class OneSignalService {
 				console.log("Foreground notification received:", event);
 				const notificationData = event.notification.additionalData;
 				
-				if (notificationData?.type === 'whisper') {
+				// Type check the additionalData
+				if (notificationData && typeof notificationData === 'object' && 'type' in notificationData && notificationData.type === 'whisper') {
 					// Show custom in-app notification for whispers
 					this.showInAppWhisperNotification(event.notification);
 				}
@@ -98,7 +99,7 @@ class OneSignalService {
 		// Add click handler to navigate to whispers
 		toast.onclick = () => {
 			const data = notification.additionalData;
-			if (data?.senderId) {
+			if (data && typeof data === 'object' && 'senderId' in data && data.senderId) {
 				window.location.href = `/whispers?conversation=${data.senderId}`;
 			} else {
 				window.location.href = '/whispers';
@@ -282,8 +283,8 @@ class OneSignalService {
 		console.log("Notification clicked:", event);
 		const data = event.notification.additionalData;
 		
-		if (data?.type === 'whisper') {
-			if (data.senderId) {
+		if (data && typeof data === 'object' && 'type' in data && data.type === 'whisper') {
+			if ('senderId' in data && data.senderId) {
 				window.location.href = `/whispers?conversation=${data.senderId}`;
 			} else {
 				window.location.href = '/whispers';

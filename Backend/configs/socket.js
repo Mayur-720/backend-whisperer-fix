@@ -1,3 +1,4 @@
+
 // configs/socket.js
 const { socketAuth } = require("../middleware/authMiddleware");
 const asyncHandler = require("express-async-handler");
@@ -7,7 +8,7 @@ module.exports = (io) => {
 	io.use(socketAuth);
 
 	io.on("connection", (socket) => {
-		console.log(`User connected: ${socket.user._id}`);
+		console.log(`User connected: ${socket.user._id}, Socket ID: ${socket.id}`);
 
 		// Join individual user room for notifications
 		socket.on("join", (userId) => {
@@ -21,6 +22,10 @@ module.exports = (io) => {
 			console.log(`User ${userId} joined individual room ${userId}`);
 		});
 
+		// Automatically join user to their own room
+		socket.join(socket.user._id.toString());
+		console.log(`User ${socket.user._id} auto-joined their room`);
+
 		// Join conversation room for whispers
 		socket.on("joinConversation", (partnerId) => {
 			const room = [socket.user._id.toString(), partnerId].sort().join(":");
@@ -33,6 +38,8 @@ module.exports = (io) => {
 			"sendWhisper",
 			asyncHandler(async ({ receiverId, content }, callback) => {
 				try {
+					console.log(`Whisper from ${socket.user._id} to ${receiverId}: ${content}`);
+					
 					const whisper = await saveWhisper({
 						senderId: socket.user._id,
 						receiverId,
@@ -41,23 +48,34 @@ module.exports = (io) => {
 						senderEmoji: socket.user.avatarEmoji,
 					});
 
-					const room = [socket.user._id.toString(), receiverId]
-						.sort()
-						.join(":");
+					console.log(`Whisper saved successfully: ${whisper._id}`);
+
+					// Emit to conversation room for real-time update
+					const room = [socket.user._id.toString(), receiverId].sort().join(":");
 					io.to(room).emit("receiveWhisper", whisper);
-					callback({ status: "success", whisper });
+					console.log(`Whisper emitted to room: ${room}`);
+
+					// Also emit to receiver's individual room
+					io.to(receiverId).emit("receiveWhisper", whisper);
+					console.log(`Whisper emitted to receiver: ${receiverId}`);
+
+					if (callback && typeof callback === 'function') {
+						callback({ status: "success", whisper });
+					}
 				} catch (error) {
 					console.error(
 						`Error sending whisper for user ${socket.user._id}:`,
 						error.message
 					);
-					callback({ status: "error", message: error.message });
+					if (callback && typeof callback === 'function') {
+						callback({ status: "error", message: error.message });
+					}
 				}
 			})
 		);
 
 		socket.on("disconnect", () => {
-			console.log(`User disconnected: ${socket.user._id}`);
+			console.log(`User disconnected: ${socket.user._id}, Socket ID: ${socket.id}`);
 		});
 	});
 };

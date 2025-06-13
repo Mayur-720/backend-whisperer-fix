@@ -22,6 +22,7 @@ const {
 	getMyWhispers,
 	getWhisperConversation,
 } = require("../controllers/whisperController");
+const User = require("../models/userModel");
 
 router.post("/register", registerUser);
 router.post("/login", loginUser);
@@ -42,9 +43,9 @@ router.get("/recognitions", protect, getRecognitions);
 router.post("/revoke-recognition", protect, revokeRecognition);
 
 // New whisper routes
-router.post("/api/whispers", protect, sendWhisper); // Send a new whisper
-router.get("/api/whispers", protect, getMyWhispers); // Get all whispers
-router.get("/api/whispers/:userId", protect, getWhisperConversation); // Get conversation with specific user
+router.post("/api/whispers", protect, sendWhisper);
+router.get("/api/whispers", protect, getMyWhispers);
+router.get("/api/whispers/:userId", protect, getWhisperConversation);
 
 // Add this route to update OneSignal player ID
 router.post("/update-onesignal-id", protect, async (req, res) => {

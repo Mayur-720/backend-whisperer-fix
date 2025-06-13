@@ -9,6 +9,8 @@ const Notification = require("../models/notificationModel");
 const saveWhisper = asyncHandler(
 	async ({ senderId, receiverId, content, senderAlias, senderEmoji }) => {
 		try {
+			console.log(`Saving whisper from ${senderId} to ${receiverId}`);
+			
 			const receiver = await User.findById(receiverId);
 			if (!receiver) {
 				console.error(`Receiver not found for ID: ${receiverId}`);
@@ -34,6 +36,8 @@ const saveWhisper = asyncHandler(
 				visibilityLevel,
 			});
 
+			console.log(`Whisper created: ${whisper._id}`);
+
 			// Save notification to database
 			const notification = await Notification.create({
 				title: `New Whisper from ${senderAlias} ${senderEmoji}`,
@@ -47,6 +51,8 @@ const saveWhisper = asyncHandler(
 					senderEmoji
 				}
 			});
+
+			console.log(`Notification created: ${notification._id}`);
 
 			// Send OneSignal push notification
 			if (receiver.oneSignalPlayerId) {
@@ -64,6 +70,7 @@ const saveWhisper = asyncHandler(
 						},
 						url: `/whispers?conversation=${senderId}`
 					});
+					console.log(`OneSignal notification sent to ${receiver.oneSignalPlayerId}`);
 				} catch (pushError) {
 					console.error('OneSignal push notification failed:', pushError);
 					// Don't throw error, just log it
@@ -78,6 +85,7 @@ const saveWhisper = asyncHandler(
 					type: 'whisper',
 					data: notification.data
 				});
+				
 				const room = [senderId.toString(), receiverId.toString()]
 					.sort()
 					.join(":");
@@ -87,7 +95,7 @@ const saveWhisper = asyncHandler(
 					type: 'whisper',
 					data: notification.data
 				});
-				console.log(`Notification emitted to ${receiverId} and room ${room}`);
+				console.log(`Socket notifications emitted to ${receiverId} and room ${room}`);
 			} else {
 				console.warn("global.io not initialized");
 			}
@@ -164,6 +172,8 @@ const sendWhisper = asyncHandler(async (req, res) => {
 		throw new Error("Please provide receiver and message content");
 	}
 
+	console.log(`REST API whisper from ${req.user._id} to ${receiverId}`);
+
 	const whisper = await saveWhisper({
 		senderId: req.user._id,
 		receiverId,
@@ -176,6 +186,8 @@ const sendWhisper = asyncHandler(async (req, res) => {
 	if (global.io) {
 		const room = [req.user._id.toString(), receiverId].sort().join(":");
 		global.io.to(room).emit("receiveWhisper", whisper);
+		global.io.to(receiverId).emit("receiveWhisper", whisper);
+		console.log(`REST whisper emitted to room: ${room} and receiver: ${receiverId}`);
 	}
 
 	res.status(201).json(whisper);
