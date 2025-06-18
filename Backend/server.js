@@ -1,4 +1,3 @@
-
 // server.js
 require("dotenv").config({ path: "./.env" });
 const express = require("express");
@@ -19,6 +18,11 @@ const ghostCircleRoutes = require("./routes/ghostCircleRoutes");
 const postRoutes = require("./routes/postRoutes");
 const whisperRoutes = require("./routes/whisperRoutes");
 const adminRoutes = require("./routes/adminRoutes");
+const promptEventRoutes = require("./routes/promptEventRoutes");
+const whisperMatchRoutes = require("./routes/whisperMatchRoutes");
+const amaRoutes = require("./routes/amaRoutes");
+const matchRoutes = require("./routes/matchRoutes");
+const adminMatchRoutes = require("./routes/adminMatchRoutes");
 
 const app = express();
 const server = http.createServer(app);
@@ -26,27 +30,41 @@ const server = http.createServer(app);
 // Initialize Redis for caching (optional, falls back gracefully)
 initRedis();
 
+// Initialize OneSignal Client
+if (process.env.ONESIGNAL_APP_ID && process.env.ONESIGNAL_REST_API_KEY) {
+	const OneSignal = require("onesignal-node");
+	global.oneSignalClient = new OneSignal.Client(
+		process.env.ONESIGNAL_APP_ID,
+		process.env.ONESIGNAL_REST_API_KEY
+	);
+	console.log("OneSignal client initialized");
+} else {
+	console.warn("OneSignal credentials not found in environment variables");
+}
+
 // Trust proxy for rate limiting
-app.set('trust proxy', 1);
+app.set("trust proxy", 1);
 
 // Security middleware
-app.use(helmet({
-  crossOriginEmbedderPolicy: false,
-  contentSecurityPolicy: false
-}));
+app.use(
+	helmet({
+		crossOriginEmbedderPolicy: false,
+		contentSecurityPolicy: false,
+	})
+);
 
 // Compression middleware for better performance
 app.use(compression());
 
 // Rate limiting
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 1000, // Limit each IP to 1000 requests per windowMs
-  message: 'Too many requests from this IP, please try again later.',
-  standardHeaders: true,
-  legacyHeaders: false,
+	windowMs: 15 * 60 * 1000, // 15 minutes
+	max: 1000, // Limit each IP to 1000 requests per windowMs
+	message: "Too many requests from this IP, please try again later.",
+	standardHeaders: true,
+	legacyHeaders: false,
 });
-app.use('/api', limiter);
+app.use("/api", limiter);
 
 const allowedOrigins = [
 	"https://underkover.in",
@@ -68,7 +86,7 @@ const corsOptions = {
 	methods: ["GET", "POST", "PUT", "DELETE"],
 	allowedHeaders: ["Content-Type", "Authorization"],
 	credentials: true,
-	optionsSuccessStatus: 200
+	optionsSuccessStatus: 200,
 };
 
 app.use(cors(corsOptions));
@@ -80,17 +98,17 @@ const io = new Server(server, {
 		methods: ["GET", "POST"],
 		credentials: true,
 	},
-	transports: ['websocket', 'polling'],
-	allowEIO3: true
+	transports: ["websocket", "polling"],
+	allowEIO3: true,
 });
 
 // Body parsing middleware (optimized order)
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: false, limit: '10mb' }));
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: false, limit: "10mb" }));
 
 // Logging middleware (only in development)
-if (process.env.NODE_ENV !== 'production') {
-  app.use(morgan("dev"));
+if (process.env.NODE_ENV !== "production") {
+	app.use(morgan("dev"));
 }
 
 // Make io globally available
@@ -104,10 +122,10 @@ ConnectTODB();
 
 // Health check route (before other routes for faster response)
 app.get("/healthcheck", (req, res) => {
-	res.status(200).json({ 
-		status: "ok", 
+	res.status(200).json({
+		status: "ok",
 		timestamp: new Date().toISOString(),
-		uptime: process.uptime()
+		uptime: process.uptime(),
 	});
 });
 
@@ -118,24 +136,31 @@ app.use("/api/ghost-circles", ghostCircleRoutes);
 app.use("/api/posts", postRoutes);
 app.use("/api/whispers", whisperRoutes);
 app.use("/api/admin", adminRoutes);
+app.use("/api/prompts", promptEventRoutes);
+app.use("/api/whisper-match", whisperMatchRoutes);
+app.use("/api/ama", amaRoutes);
+
+// ----- NEW ROUTES FOR MATCH FEATURES AND ADMIN -----
+app.use("/api/match", matchRoutes);
+app.use("/api/admin", adminMatchRoutes);
 
 // 404 handler
-app.use('*', (req, res) => {
-	res.status(404).json({ message: 'Route not found' });
+app.use("*", (req, res) => {
+	res.status(404).json({ message: "Route not found" });
 });
 
 // Error handling middleware (optimized)
 app.use((err, req, res, next) => {
 	const statusCode = res.statusCode === 200 ? 500 : res.statusCode;
-	
-	console.error('Error:', {
+
+	console.error("Error:", {
 		message: err.message,
-		stack: process.env.NODE_ENV === 'production' ? null : err.stack,
+		stack: process.env.NODE_ENV === "production" ? null : err.stack,
 		url: req.url,
 		method: req.method,
-		timestamp: new Date().toISOString()
+		timestamp: new Date().toISOString(),
 	});
-	
+
 	res.status(statusCode).json({
 		message: err.message,
 		stack: process.env.NODE_ENV === "production" ? null : err.stack,
@@ -143,16 +168,16 @@ app.use((err, req, res, next) => {
 });
 
 // Graceful shutdown
-process.on('SIGTERM', () => {
-	console.log('SIGTERM received, shutting down gracefully');
+process.on("SIGTERM", () => {
+	console.log("SIGTERM received, shutting down gracefully");
 	server.close(() => {
-		console.log('Process terminated');
+		console.log("Process terminated");
 	});
 });
 
 const PORT = process.env.PORT || 8900;
 server.listen(PORT, () => {
 	console.log(`🚀 Server running on port ${PORT}`);
-	console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
-	console.log(`🔗 Health check: http://localhost:${PORT}/healthcheck`);
+	console.log(`📊 Environment: ${process.env.NODE_ENV || "development"}`);
+	console.log(`🔗 Health check: ${process.env.FRONTEND_URL}/healthcheck`);
 });

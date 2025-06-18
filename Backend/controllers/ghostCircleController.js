@@ -121,7 +121,7 @@ const inviteToGhostCircle = asyncHandler(async (req, res) => {
 const getGhostCircleById = asyncHandler(async (req, res) => {
   const ghostCircle = await GhostCircle.findById(req.params.id).populate({
     path: 'members.userDetails',
-    select: 'anonymousAlias',
+    select: 'anonymousAlias username',
   });
 
   if (!ghostCircle) {
@@ -129,22 +129,63 @@ const getGhostCircleById = asyncHandler(async (req, res) => {
     throw new Error('Ghost circle not found');
   }
 
+  // The currently logged in user (requester)
+  const currentUser = await User.findById(req.user._id);
+
+  if (!currentUser) {
+    res.status(404);
+    throw new Error('Requester not found');
+  }
+
+  // Only allowed if requester is a member
   const isMember = ghostCircle.members.some(member => 
     member.userId.toString() === req.user._id.toString()
   );
-
   if (!isMember) {
     res.status(403);
     throw new Error('Not authorized to view this ghost circle');
   }
 
-  const membersWithAliases = ghostCircle.members.map(member => {
-    const userDetails = member.userDetails && member.userDetails.length > 0 ? member.userDetails[0] : {};
-    return {
-      ...member.toObject(),
-      anonymousAlias: userDetails.anonymousAlias || 'Anonymous',
-    };
-  });
+  // Build member info (anonymous + real username if recognized)
+  const recognizedIds = Array.isArray(currentUser.recognizedUsers)
+    ? currentUser.recognizedUsers.map(id => id.toString())
+    : [];
+
+  const membersWithAliases = await Promise.all(
+    ghostCircle.members.map(async member => {
+      // Fetch the user data for anon/name
+      let anonymousAlias = "Anonymous";
+      let username;
+      let avatarEmoji;
+      if (member.userDetails && member.userDetails.length > 0) {
+        anonymousAlias = member.userDetails[0].anonymousAlias || "Anonymous";
+        username = member.userDetails[0].username;
+      } else {
+        // fallback
+        const memberUser = await User.findById(member.userId).select("anonymousAlias username avatarEmoji");
+        if (memberUser) {
+          anonymousAlias = memberUser.anonymousAlias;
+          username = memberUser.username;
+        }
+      }
+
+      // Determine if recognized by requester
+      let displayName = anonymousAlias;
+      let realUsername = null;
+      if (recognizedIds.includes(member.userId.toString())) {
+        displayName = username || anonymousAlias;
+        realUsername = username || null;
+      }
+      return {
+        userId: member.userId,
+        displayName,
+        anonymousAlias,
+        realUsername, // only set if recognized by requester
+        joinedAt: member.joinedAt,
+        avatarEmoji: member.avatarEmoji || "",
+      };
+    })
+  );
 
   res.json({
     ...ghostCircle.toObject(),
